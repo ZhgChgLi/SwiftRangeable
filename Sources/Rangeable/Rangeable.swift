@@ -177,12 +177,408 @@ public struct Rangeable<Element: Hashable> {
         return dup
     }
 
+    // MARK: - Removal API (v2; RFC §6.6 / §6.7 / §6.8 / §6.9)
+
+    /// Removes the closed interval `[start, end]` from `R(element)`.
+    ///
+    /// Implements RFC §6.6:
+    ///  * Pre-condition `start <= end` (D1) — throws otherwise.
+    ///  * If `element ∉ keys(self)` or no entry overlaps `[start, end]`,
+    ///    the call is a no-op and `version` MUST NOT bump (RFC §4.10
+    ///    (N3)).
+    ///  * Otherwise the overlapping entries are sliced into 0..2 residual
+    ///    sub-intervals each; if every residual collapses to nothing, the
+    ///    element is eagerly pruned per RFC §4.10 (N1).
+    ///
+    /// - Throws: `RangeableError.invalidInterval` when `start > end`. The
+    ///   container state MUST be unchanged on throw (atomicity).
+    public mutating func remove(_ element: Element, start: Int, end: Int) throws {
+        guard start <= end else {
+            throw RangeableError.invalidInterval(start: start, end: end)
+        }
+        ensureUniqueStorage()
+
+        // Step 2: element-presence fast-path.
+        guard var set = storage.intervals[element] else {
+            return
+        }
+
+        let result = set.subtract(lo: start, hi: end)
+        switch result {
+        case .unchanged:
+            // No-op — version unchanged, event_index unchanged.
+            return
+        case .mutated(let becameEmpty):
+            if becameEmpty {
+                // Eager prune: excise from intervals, insertion_order, ord.
+                excise(element)
+            } else {
+                storage.intervals[element] = set
+            }
+            storage.version &+= 1
+            storage.eventIndex = nil
+        }
+    }
+
+    /// Sugar for `remove(element, start: range.lowerBound, end: range.upperBound)`.
+    /// `ClosedRange<Int>` already enforces `lowerBound <= upperBound`.
+    public mutating func remove(_ element: Element, over range: ClosedRange<Int>) throws {
+        try remove(element, start: range.lowerBound, end: range.upperBound)
+    }
+
+    /// Removes the element entirely, regardless of how many intervals it
+    /// has. RFC §6.7. No-op (no version bump) if the element was never
+    /// inserted.
+    public mutating func remove(_ element: Element) {
+        ensureUniqueStorage()
+        guard storage.intervals[element] != nil else {
+            return
+        }
+        excise(element)
+        storage.version &+= 1
+        storage.eventIndex = nil
+    }
+
+    /// Empties the container. RFC §6.8. No-op (no version bump) when
+    /// already empty.
+    public mutating func removeAll() {
+        ensureUniqueStorage()
+        if storage.intervals.isEmpty {
+            return
+        }
+        storage.intervals.removeAll(keepingCapacity: false)
+        storage.insertionOrder.removeAll(keepingCapacity: false)
+        storage.ord.removeAll(keepingCapacity: false)
+        storage.version &+= 1
+        storage.eventIndex = nil
+    }
+
+    /// Removes `[start, end]` from every element's `R(e)` in one atomic
+    /// step. Bumps `version` exactly once when at least one element
+    /// actually changed; throws on `start > end` before any mutation.
+    /// RFC §6.9.
+    public mutating func removeRanges(start: Int, end: Int) throws {
+        guard start <= end else {
+            throw RangeableError.invalidInterval(start: start, end: end)
+        }
+        ensureUniqueStorage()
+
+        // Walk every element in the current insertion order, but defer the
+        // O(E) `insertion_order` rebuild until after the per-element loop
+        // (avoids the O(E²) trap of `delete_at` per element).
+        var anyChange = false
+        let snapshot = storage.insertionOrder
+        for element in snapshot {
+            guard var set = storage.intervals[element] else { continue }
+            let result = set.subtract(lo: start, hi: end)
+            switch result {
+            case .unchanged:
+                continue
+            case .mutated(let becameEmpty):
+                anyChange = true
+                if becameEmpty {
+                    storage.intervals.removeValue(forKey: element)
+                    storage.ord.removeValue(forKey: element)
+                    // insertion_order rebuild deferred to after the loop.
+                } else {
+                    storage.intervals[element] = set
+                }
+            }
+        }
+
+        if !anyChange {
+            return
+        }
+
+        // Single-pass rebuild of insertion_order + ord (RFC §6.9 step 4).
+        let survivors = snapshot.filter { storage.intervals[$0] != nil }
+        if survivors.count != snapshot.count {
+            storage.insertionOrder = survivors
+            storage.ord.removeAll(keepingCapacity: true)
+            for (idx, e) in survivors.enumerated() {
+                storage.ord[e] = idx + 1
+            }
+        }
+        storage.version &+= 1
+        storage.eventIndex = nil
+    }
+
+    /// Sugar form using `ClosedRange<Int>`.
+    public mutating func removeRanges(over range: ClosedRange<Int>) throws {
+        try removeRanges(start: range.lowerBound, end: range.upperBound)
+    }
+
+    // MARK: - Set operations (v2; RFC §6.10–§6.13)
+
+    /// Mutating union with `other` (RFC §6.10 in-place form). Bumps
+    /// `version` iff the result is structurally `!= self` (any keys added,
+    /// any `R(e)` enlarged). When `other` shares storage with `self`, the
+    /// op is a no-op (idempotence dual of RFC §3.2).
+    public mutating func formUnion(_ other: Rangeable<Element>) {
+        ensureUniqueStorage()
+        // Self-union shortcut: same storage means structurally identical.
+        if storage === other.storage {
+            return
+        }
+        let merged = Rangeable.computeUnion(self, other)
+        if !Rangeable.storageEquivalent(self, merged) {
+            adoptStorage(of: merged, bumpVersion: true)
+        }
+    }
+
+    /// Non-mutating union with `other`. Returns a fresh `Rangeable` with
+    /// `version == 0`; the source is unchanged.
+    public func union(_ other: Rangeable<Element>) -> Rangeable<Element> {
+        return Rangeable.computeUnion(self, other)
+    }
+
+    /// Mutating intersection with `other` (RFC §6.11 in-place form). Bumps
+    /// `version` iff the result is structurally `!= self` (any keys
+    /// dropped, any `R(e)` shrunk).
+    public mutating func formIntersection(_ other: Rangeable<Element>) {
+        ensureUniqueStorage()
+        if storage === other.storage {
+            return
+        }
+        let intersected = Rangeable.computeIntersection(self, other)
+        if !Rangeable.storageEquivalent(self, intersected) {
+            adoptStorage(of: intersected, bumpVersion: true)
+        }
+    }
+
+    /// Non-mutating intersection with `other`. Returns a fresh
+    /// `Rangeable` with `version == 0`.
+    public func intersection(_ other: Rangeable<Element>) -> Rangeable<Element> {
+        return Rangeable.computeIntersection(self, other)
+    }
+
+    /// Mutating set difference (RFC §6.12 in-place form). Bumps `version`
+    /// iff any `R_self(e)` shrunk.
+    public mutating func subtract(_ other: Rangeable<Element>) {
+        ensureUniqueStorage()
+        if storage === other.storage {
+            // self ∖ self == ∅; only bump if self had anything to remove.
+            if !storage.insertionOrder.isEmpty {
+                removeAll()
+            }
+            return
+        }
+        let diff = Rangeable.computeDifference(self, other)
+        if !Rangeable.storageEquivalent(self, diff) {
+            adoptStorage(of: diff, bumpVersion: true)
+        }
+    }
+
+    /// Non-mutating set difference. Returns a fresh `Rangeable` with
+    /// `version == 0`.
+    public func subtracting(_ other: Rangeable<Element>) -> Rangeable<Element> {
+        return Rangeable.computeDifference(self, other)
+    }
+
+    /// Mutating symmetric difference (RFC §6.13 in-place form). Bumps
+    /// `version` iff the result is structurally `!= self`. Note that
+    /// `r.formSymmetricDifference(r)` clears `r` and bumps once.
+    public mutating func formSymmetricDifference(_ other: Rangeable<Element>) {
+        ensureUniqueStorage()
+        if storage === other.storage {
+            if !storage.insertionOrder.isEmpty {
+                removeAll()
+            }
+            return
+        }
+        let sym = Rangeable.computeSymmetricDifference(self, other)
+        if !Rangeable.storageEquivalent(self, sym) {
+            adoptStorage(of: sym, bumpVersion: true)
+        }
+    }
+
+    /// Non-mutating symmetric difference. Returns a fresh `Rangeable`
+    /// with `version == 0`.
+    public func symmetricDifference(_ other: Rangeable<Element>) -> Rangeable<Element> {
+        return Rangeable.computeSymmetricDifference(self, other)
+    }
+
     // MARK: - Private helpers
 
     private mutating func ensureUniqueStorage() {
         if !isKnownUniquelyReferenced(&storage) {
             storage = Storage(copying: storage)
         }
+    }
+
+    /// Excises `element` from all three element-keyed structures and
+    /// densely renumbers `ord` over the remaining elements (RFC §4.10
+    /// (N1)). The caller owns the version bump and event-index
+    /// invalidation.
+    private func excise(_ element: Element) {
+        guard let idx = storage.insertionOrder.firstIndex(of: element) else { return }
+        storage.intervals.removeValue(forKey: element)
+        storage.insertionOrder.remove(at: idx)
+        storage.ord.removeValue(forKey: element)
+        // Dense renumber for elements at positions >= idx.
+        for i in idx..<storage.insertionOrder.count {
+            storage.ord[storage.insertionOrder[i]] = i + 1
+        }
+    }
+
+    /// Replaces `self.storage` with the result of a set-op compute. When
+    /// `bumpVersion` is true, `version` is incremented exactly once over
+    /// the previous self (per RFC §6.10–§6.13 mutating-form rule); the
+    /// fresh container's `version == 0` is intentionally discarded.
+    private mutating func adoptStorage(of fresh: Rangeable<Element>, bumpVersion: Bool) {
+        let priorVersion = storage.version
+        // The compute helpers always produce a uniquely owned storage.
+        storage = fresh.storage
+        if bumpVersion {
+            storage.version = priorVersion &+ 1
+        } else {
+            storage.version = priorVersion
+        }
+        storage.eventIndex = nil
+    }
+
+    /// Tests whether two `Rangeable`s have the same observable contents:
+    /// same `insertion_order`, same per-element entries, same `ord`. Used
+    /// to drive the mutating set-ops' "no actual change" branch (RFC
+    /// §6.10 idempotence dual).
+    private static func storageEquivalent(_ a: Rangeable<Element>, _ b: Rangeable<Element>) -> Bool {
+        if a.storage === b.storage { return true }
+        if a.storage.insertionOrder != b.storage.insertionOrder { return false }
+        if a.storage.intervals.count != b.storage.intervals.count { return false }
+        for e in a.storage.insertionOrder {
+            guard let sa = a.storage.intervals[e], let sb = b.storage.intervals[e] else {
+                return false
+            }
+            if sa.entries != sb.entries { return false }
+        }
+        return true
+    }
+
+    // MARK: - Set-op compute helpers (build fresh Rangeable; never call insert())
+
+    /// Builds a fresh `Rangeable` whose storage is populated directly,
+    /// bypassing `insert()` so we avoid per-iteration version bumps and
+    /// event-index rebuilds (RFC §B.1 Swift implementation note).
+    private static func makeFromCanonical(
+        _ contents: [(element: Element, entries: [Interval])]
+    ) -> Rangeable<Element> {
+        let fresh = Rangeable<Element>()
+        let s = fresh.storage
+        s.insertionOrder.reserveCapacity(contents.count)
+        for (idx, item) in contents.enumerated() {
+            s.intervals[item.element] = DisjointSet(canonicalEntries: item.entries)
+            s.insertionOrder.append(item.element)
+            s.ord[item.element] = idx + 1
+        }
+        s.version = 0
+        s.eventIndex = nil
+        return fresh
+    }
+
+    /// Builds the union per RFC §6.10. Walks `lhs.insertion_order` first
+    /// (each key in self appears, possibly extended by other), then
+    /// tail-appends keys in `keys(other) ∖ keys(self)` in `other`'s
+    /// insertion order.
+    private static func computeUnion(
+        _ lhs: Rangeable<Element>,
+        _ rhs: Rangeable<Element>
+    ) -> Rangeable<Element> {
+        var contents: [(element: Element, entries: [Interval])] = []
+        contents.reserveCapacity(lhs.storage.insertionOrder.count + rhs.storage.insertionOrder.count)
+
+        for e in lhs.storage.insertionOrder {
+            // R(e) is non-empty by (I1.4) — guaranteed by eager pruning.
+            let lset = lhs.storage.intervals[e]!
+            if let rset = rhs.storage.intervals[e] {
+                contents.append((e, lset.unionList(rset)))
+            } else {
+                contents.append((e, lset.entries))
+            }
+        }
+
+        for e in rhs.storage.insertionOrder {
+            if lhs.storage.intervals[e] != nil { continue }
+            // Tail-append in other's insertion order.
+            let rset = rhs.storage.intervals[e]!
+            contents.append((e, rset.entries))
+        }
+
+        return makeFromCanonical(contents)
+    }
+
+    /// Builds the intersection per RFC §6.11. Walks `lhs.insertion_order`
+    /// over keys also in `rhs`; eager-prunes any element whose intersection
+    /// is empty.
+    private static func computeIntersection(
+        _ lhs: Rangeable<Element>,
+        _ rhs: Rangeable<Element>
+    ) -> Rangeable<Element> {
+        var contents: [(element: Element, entries: [Interval])] = []
+        contents.reserveCapacity(Swift.min(lhs.storage.insertionOrder.count, rhs.storage.insertionOrder.count))
+        for e in lhs.storage.insertionOrder {
+            guard let rset = rhs.storage.intervals[e] else { continue }
+            let lset = lhs.storage.intervals[e]!
+            let inter = lset.intersectList(rset)
+            if inter.isEmpty { continue }   // eager prune §4.10 (N1)
+            contents.append((e, inter))
+        }
+        return makeFromCanonical(contents)
+    }
+
+    /// Builds the difference per RFC §6.12. Walks `lhs.insertion_order`;
+    /// every element either survives intact (no key in `rhs`) or is
+    /// subtracted via `subtractList`.
+    private static func computeDifference(
+        _ lhs: Rangeable<Element>,
+        _ rhs: Rangeable<Element>
+    ) -> Rangeable<Element> {
+        var contents: [(element: Element, entries: [Interval])] = []
+        contents.reserveCapacity(lhs.storage.insertionOrder.count)
+        for e in lhs.storage.insertionOrder {
+            let lset = lhs.storage.intervals[e]!
+            let remaining: [Interval]
+            if let rset = rhs.storage.intervals[e] {
+                remaining = lset.subtractList(rset)
+            } else {
+                remaining = lset.entries
+            }
+            if remaining.isEmpty { continue }   // eager prune §4.10 (N1)
+            contents.append((e, remaining))
+        }
+        return makeFromCanonical(contents)
+    }
+
+    /// Builds the symmetric difference per RFC §6.13. Self-primary keys
+    /// are walked first (using the `(a∖b) ∪ (b∖a)` identity per element);
+    /// other-only keys are tail-appended in `other`'s insertion order.
+    private static func computeSymmetricDifference(
+        _ lhs: Rangeable<Element>,
+        _ rhs: Rangeable<Element>
+    ) -> Rangeable<Element> {
+        var contents: [(element: Element, entries: [Interval])] = []
+        contents.reserveCapacity(lhs.storage.insertionOrder.count + rhs.storage.insertionOrder.count)
+
+        for e in lhs.storage.insertionOrder {
+            let lset = lhs.storage.intervals[e]!
+            let sym: [Interval]
+            if let rset = rhs.storage.intervals[e] {
+                sym = lset.symmetricDifferenceList(rset)
+            } else {
+                // R_other(e) == ∅ ⇒ symdiff degenerates to R_self(e).
+                sym = lset.entries
+            }
+            if sym.isEmpty { continue }   // eager prune §4.10 (N1)
+            contents.append((e, sym))
+        }
+
+        for e in rhs.storage.insertionOrder {
+            if lhs.storage.intervals[e] != nil { continue }
+            // R_self(e) == ∅ ⇒ symdiff degenerates to R_other(e).
+            let rset = rhs.storage.intervals[e]!
+            contents.append((e, rset.entries))
+        }
+
+        return makeFromCanonical(contents)
     }
 
     /// Ensures the event index is fresh and returns a `BoundaryIndex`
