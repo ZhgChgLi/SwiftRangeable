@@ -87,12 +87,16 @@ See [RangeableRFC](https://github.com/ZhgChgLi/RangeableRFC) § 4 for normative 
 
 ## Cross-language consistency
 
-The Swift implementation here and the [Ruby implementation](https://github.com/ZhgChgLi/RubyRangeable) share a 160-op / 86-probe JSON fixture; both produce byte-identical outputs.
+This Swift implementation joins the [Ruby](https://github.com/ZhgChgLi/RubyRangeable), [Python](https://github.com/ZhgChgLi/PythonRangeable), [JS](https://github.com/ZhgChgLi/JSRangeable), [Kotlin](https://github.com/ZhgChgLi/KotlinRangeable) and [Go](https://github.com/ZhgChgLi/GoRangeable) implementations. All six share a 160-op / 86-probe JSON fixture and produce byte-identical outputs.
 
 ## See also
 
 - **[RangeableRFC](https://github.com/ZhgChgLi/RangeableRFC)** — normative specification.
-- **[RubyRangeable](https://github.com/ZhgChgLi/RubyRangeable)** — sibling Ruby reference implementation, published as the `rangeable` gem.
+- **[RubyRangeable](https://github.com/ZhgChgLi/RubyRangeable)** — Ruby reference (`gem install rangeable`).
+- **[PythonRangeable](https://github.com/ZhgChgLi/PythonRangeable)** — Python reference (`pip install rangeable`).
+- **[JSRangeable](https://github.com/ZhgChgLi/JSRangeable)** — TypeScript reference (`npm i rangeable-js`).
+- **[KotlinRangeable](https://github.com/ZhgChgLi/KotlinRangeable)** — Kotlin/JVM reference (JitPack).
+- **[GoRangeable](https://github.com/ZhgChgLi/GoRangeable)** — Go reference (`go get github.com/ZhgChgLi/GoRangeable`).
 
 ## Development
 
