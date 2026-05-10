@@ -109,3 +109,9 @@ $ swift test
 ## License
 
 MIT © [ZhgChgLi](https://github.com/ZhgChgLi)
+
+# Buy me a beer ❤️❤️❤️
+
+[![Buy Me A Beer](https://github.com/user-attachments/assets/63f01edf-2aa5-4d91-8f8a-861e5b6b4feb)](https://www.paypal.com/ncp/payment/CMALMPT8UUTY2)
+
+[**If this project has helped you, feel free to sponsor me a cup of coffee, thank you.**](https://www.paypal.com/ncp/payment/CMALMPT8UUTY2)
